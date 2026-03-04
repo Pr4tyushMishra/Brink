@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String       @id @default(auto()) @map("_id") @db.ObjectId
+  email        String       @unique
+  passwordHash String
+  name         String       // Added name to show on the collaborative UI profile icon
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  boards       Board[]      @relation("BoardOwner")
+  sharedBoards BoardShare[]
+}
+
+model Board {
+  id              String       @id @map("_id") // We'll keep String id since the frontend generates UUIDs for it
+  projectId       String?
+  name            String
+  isCollaborative Boolean      @default(false)
+  
+  // Ownership
+  ownerId         String?      @db.ObjectId
+  owner           User?        @relation("BoardOwner", fields: [ownerId], references: [id])
+
+  createdAt       String
+  updatedAt       String
+  
+  // Relations
+  entities        Entity[]
+  events          Event[]
+  shares          BoardShare[]
+}
+
+enum Role {
+  VIEWER
+  EDITOR
+}
+
+model BoardShare {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  boardId   String
+  userId    String   @db.ObjectId
+  role      Role     @default(VIEWER)
+
+  board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([boardId, userId]) // A user can only have one share record per board
+}
+
+model Event {
+  id        String   @id @map("_id")
+  boardId   String
+  type      String
+  payload   Json
+  createdAt String
+
+  board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+}
+
+model Entity {
+  id        String   @id @map("_id")
+  boardId   String
+  type      String
+  transform Json
+  props     Json?
+  metadata  Json?
+  visible   Boolean  @default(true)
+  parentId  String?
+
+  board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+}
