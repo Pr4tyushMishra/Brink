@@ -1,0 +1,1 @@
+export { BoardEditor as default } from './canvas/components/BoardEditor';
