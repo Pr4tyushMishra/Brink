@@ -1,3 +1,6 @@
+export type Project = { id: string; name: string };
+export type Board = { id: string; projectId: string; name: string; lastEdited: string };
+
 export type Point = { x: number; y: number };
 export type BBox = { minX: number; minY: number; maxX: number; maxY: number };
 export type HandleType = 'tl' | 'tr' | 'bl' | 'br';

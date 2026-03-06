@@ -5,6 +5,7 @@ import { FRAME_PRESETS, getAnchorPoint } from './types';
 import { RectangleType, StickyNoteType, TextType, EllipseType, TriangleType, DiamondType, LineType, ArrowType, FrameType, ImageType } from './ObjectTypes';
 import { SelectionModule } from './modules/SelectionModule';
 import { ConnectionModule } from './modules/ConnectionModule';
+import { LockModule } from './modules/LockModule';
 import { EVENTS } from './EventBus';
 import { Renderer } from './Renderer';
 import { io, Socket } from 'socket.io-client';
@@ -30,6 +31,15 @@ export class CanvasEngine {
     draggedChildrenIds: string[] = [];
     dragOffset: Point = { x: 0, y: 0 };
 
+    // Marquee selection state
+    isMarqueeSelecting = false;
+    marqueeStart: Point | null = null;
+    marqueeEnd: Point | null = null;
+
+    // Multi-selection drag state
+    isMultiDragging = false;
+    multiDragOffsets: Map<string, Point> = new Map();
+
     creatingEntityId: string | null = null;
     createStartPoint: Point | null = null;
 
@@ -47,6 +57,8 @@ export class CanvasEngine {
     onRoleAssigned?: (role: string) => void;
     selectionModule: SelectionModule;
     connectionModule: ConnectionModule;
+    lockModule: LockModule;
+    lockUserName: string = 'User';
 
     socket: Socket;
     boardId: string;
@@ -54,6 +66,9 @@ export class CanvasEngine {
 
     private networkFlushTimer = 0;
     private pendingNetworkUpdates = new Map<string, CanvasEntity>();
+
+    remoteMarquees = new Map<string, { rect: { minX: number, minY: number, maxX: number, maxY: number }, userName: string }>();
+    private lastMarqueeBroadcast = false;
 
     constructor(canvas: HTMLCanvasElement, boardId: string, token: string) {
         this.canvas = canvas;
@@ -78,6 +93,8 @@ export class CanvasEngine {
         this.connectionModule = new ConnectionModule();
         this.scene.registerFeatureModule(this.connectionModule);
 
+        this.lockModule = new LockModule();
+
         // 1. Initialize Network Socket
         this.socket = io('http://localhost:3000', {
             auth: { token: this.token }
@@ -86,6 +103,8 @@ export class CanvasEngine {
         this.socket.on('connect', () => {
             console.log('[CanvasEngine] Connected to Backend WebSocket');
             this.socket.emit('JOIN_BOARD', this.boardId);
+            // Attach lock module to socket once connected
+            try { this.lockModule.attach(this.socket, this.boardId, () => { this.isDirty = true; }); } catch (_) { }
         });
 
         this.socket.on('ROLE_ASSIGNED', (role: string) => {
@@ -121,15 +140,24 @@ export class CanvasEngine {
             try {
                 if (event.type === 'ENTITY_CREATED') {
                     if (!this.scene.getObject(event.payload.entity.id)) {
-                        this.scene.loadData([event.payload.entity]);
+                        const e = event.payload.entity;
+                        this.scene.createObject(e.type, e.props, e.transform, e.metadata, e.parentId, true);
+                        markDirty();
                     }
-                } else if (event.type === 'ENTITY_UPDATED') {
-                    this.scene.updateObject(event.payload.entity.id, {
-                        transform: event.payload.entity.transform,
-                        props: event.payload.entity.props
-                    });
+                } else if (event.type === 'ENTITY_UPDATED' || event.type === 'ENTITY_DRAGGING') {
+                    // Support both new lightweight format (entityId + updates) and legacy (entity)
+                    const entityId = event.payload.entityId || event.payload.entity?.id;
+                    const updates = event.payload.updates || {
+                        transform: event.payload.entity?.transform,
+                        props: event.payload.entity?.props
+                    };
+                    if (entityId) {
+                        this.scene.updateObject(entityId, updates, true);
+                    }
+                    markDirty();
                 } else if (event.type === 'ENTITY_DELETED') {
-                    this.scene.deleteObject(event.payload.entityId);
+                    this.scene.deleteObject(event.payload.entityId, true);
+                    markDirty();
                 } else if (event.type === 'VIEWPORT_UPDATE') {
                     // Force the camera to jump to the presenter's view
                     this.camera.x = event.payload.x;
@@ -137,13 +165,36 @@ export class CanvasEngine {
                     this.camera.zoom = event.payload.zoom;
                     if (this.onZoomChange) this.onZoomChange(this.camera.zoom);
                     markDirty();
+                } else if (event.type === 'MARQUEE_UPDATE') {
+                    const senderId = event.payload.senderId;
+                    if (event.payload.rect) {
+                        this.remoteMarquees.set(senderId, { rect: event.payload.rect, userName: event.payload.userName });
+                    } else {
+                        this.remoteMarquees.delete(senderId);
+                    }
+                    markDirty();
+                } else if (event.type === 'ENTITY_LOCKED') {
+                    try { this.lockModule.handleRemoteLock(event.payload); } catch (_) { }
+                } else if (event.type === 'ENTITY_UNLOCKED') {
+                    try { this.lockModule.handleRemoteUnlock(event.payload); } catch (_) { }
                 }
             } catch (e) {
                 console.error("Error handling SYNC_EVENT", e);
             }
         });
 
-        this.scene.events.on(EVENTS.SELECTION_CHANGED, markDirty);
+        this.scene.events.on(EVENTS.SELECTION_CHANGED, (selectedIds: string[]) => {
+            markDirty();
+            // Emit lock/unlock based on selection changes
+            try {
+                const userName = 'User'; // Will be overridden by BoardEditor if available
+                if (selectedIds.length > 0) {
+                    this.lockModule.lockEntities(selectedIds, this.lockUserName || userName);
+                } else {
+                    this.lockModule.unlockAll();
+                }
+            } catch (_) { }
+        });
         window.addEventListener('canvas-dirty', markDirty);
 
         this.setupEvents();
@@ -180,6 +231,8 @@ export class CanvasEngine {
         this.canvas.removeEventListener('wheel', this.onWheel);
         window.removeEventListener('canvas-dirty', () => { this.isDirty = true; });
         cancelAnimationFrame(this.animationFrameId);
+
+        try { this.lockModule.destroy(); } catch (_) { }
 
         if (this.socket) {
             this.socket.disconnect();
@@ -343,42 +396,73 @@ export class CanvasEngine {
 
             const hit = this.hitTestGlobal(w.x, w.y);
             if (hit) {
-                this.selectionModule.select(hit.id);
+                // Block selection of entities locked by other users
+                try {
+                    if (this.lockModule.isLockedByOther(hit.id)) {
+                        this.canvas.style.cursor = 'not-allowed';
+                        // Reset selection/drag states so Marquee doesn't accidentally start
+                        this.isMarqueeSelecting = false;
+                        this.marqueeStart = null;
+                        this.marqueeEnd = null;
+                        this.selectionModule.clearSelection();
+                        return;
+                    }
+                } catch (_) { }
 
-                const isLineOrArrow = hit.type === 'LINE' || hit.type === 'ARROW';
-                if (!isLineOrArrow) {
-                    this.draggedEntityId = hit.id;
-                    this.dragOffset = { x: w.x - hit.transform.x, y: w.y - hit.transform.y };
+                // Check if the hit entity is already part of a multi-selection
+                const currentlySelected = this.selectionModule.getSelectedIds();
+                const hitIsSelected = currentlySelected.includes(hit.id);
 
-                    // GROUP DRAGGING
-                    if (hit.type === 'FRAME') {
-                        const isDevice = ['Mobile', 'Tablet', 'Desktop'].includes(hit.props.name);
-
-                        if (isDevice) {
-                            // Device frames explicitly move constrained children
-                            this.draggedChildrenIds = this.scene.getAllObjects().filter(o => o.parentId === hit.id).map(o => o.id);
-                        } else {
-                            // Standard frames spatially contain objects
-                            const frameBox = this.scene.getObjectType('FRAME')!.getBBox(hit);
-                            this.draggedChildrenIds = this.scene.getAllObjects().filter(o => {
-                                if (o.id === hit.id) return false;
-                                if (o.parentId === hit.id) return true;
-                                if (o.parentId) return false;
-                                if ((o.type === 'LINE' || o.type === 'ARROW') && (o.props.startConnectedId || o.props.endConnectedId)) return false;
-                                const def = this.scene.getObjectType(o.type);
-                                if (!def) return false;
-                                const box = def.getBBox(o);
-                                return box.minX >= frameBox.minX && box.maxX <= frameBox.maxX &&
-                                    box.minY >= frameBox.minY && box.maxY <= frameBox.maxY;
-                            }).map(o => o.id);
+                if (hitIsSelected && currentlySelected.length > 1) {
+                    // Start multi-drag: move ALL selected entities together
+                    this.isMultiDragging = true;
+                    this.multiDragOffsets.clear();
+                    currentlySelected.forEach(id => {
+                        const obj = this.scene.getObject(id);
+                        if (obj) {
+                            this.multiDragOffsets.set(id, { x: w.x - obj.transform.x, y: w.y - obj.transform.y });
                         }
-                    } else {
-                        this.draggedChildrenIds = [];
+                    });
+                } else {
+                    // Single entity select + drag
+                    this.selectionModule.select(hit.id);
+
+                    const isLineOrArrow = hit.type === 'LINE' || hit.type === 'ARROW';
+                    if (!isLineOrArrow) {
+                        this.draggedEntityId = hit.id;
+                        this.dragOffset = { x: w.x - hit.transform.x, y: w.y - hit.transform.y };
+
+                        // GROUP DRAGGING (frames drag their children)
+                        if (hit.type === 'FRAME') {
+                            const isDevice = ['Mobile', 'Tablet', 'Desktop'].includes(hit.props.name);
+
+                            if (isDevice) {
+                                this.draggedChildrenIds = this.scene.getAllObjects().filter(o => o.parentId === hit.id).map(o => o.id);
+                            } else {
+                                const frameBox = this.scene.getObjectType('FRAME')!.getBBox(hit);
+                                this.draggedChildrenIds = this.scene.getAllObjects().filter(o => {
+                                    if (o.id === hit.id) return false;
+                                    if (o.parentId === hit.id) return true;
+                                    if (o.parentId) return false;
+                                    if ((o.type === 'LINE' || o.type === 'ARROW') && (o.props.startConnectedId || o.props.endConnectedId)) return false;
+                                    const def = this.scene.getObjectType(o.type);
+                                    if (!def) return false;
+                                    const box = def.getBBox(o);
+                                    return box.minX >= frameBox.minX && box.maxX <= frameBox.maxX &&
+                                        box.minY >= frameBox.minY && box.maxY <= frameBox.maxY;
+                                }).map(o => o.id);
+                            }
+                        } else {
+                            this.draggedChildrenIds = [];
+                        }
                     }
                 }
             } else {
+                // Empty space click — start marquee selection
                 this.selectionModule.clearSelection();
-                this.isPanning = true;
+                this.isMarqueeSelecting = true;
+                this.marqueeStart = { x: w.x, y: w.y };
+                this.marqueeEnd = { x: w.x, y: w.y };
             }
         }
     };
@@ -399,7 +483,7 @@ export class CanvasEngine {
     private onPointerMove = (e: PointerEvent) => {
         const w = this.camera.screenToWorld(e.clientX, e.clientY);
 
-        if (!this.isPanning && !this.draggedEntityId && !this.isResizing) {
+        if (!this.isPanning && !this.draggedEntityId && !this.isResizing && !this.isMarqueeSelecting && !this.isMultiDragging) {
             let cursor = 'default';
             let newHoverId: string | null = null;
             let newHoverAnchor: AnchorPosition | null = null;
@@ -540,6 +624,29 @@ export class CanvasEngine {
             return;
         }
 
+        // Marquee drag — update end point
+        if (this.isMarqueeSelecting && this.marqueeStart) {
+            this.marqueeEnd = { x: w.x, y: w.y };
+            this.isDirty = true;
+            this.lastMouse = { x: e.clientX, y: e.clientY };
+            return;
+        }
+
+        // Multi-selection drag — move all selected entities
+        if (this.isMultiDragging && this.multiDragOffsets.size > 0) {
+            this.multiDragOffsets.forEach((offset, id) => {
+                const obj = this.scene.getObject(id);
+                if (obj) {
+                    this.scene.updateObject(id, {
+                        transform: { x: w.x - offset.x, y: w.y - offset.y }
+                    });
+                }
+            });
+            this.isDirty = true;
+            this.lastMouse = { x: e.clientX, y: e.clientY };
+            return;
+        }
+
         if (!this.isPanning && !this.draggedEntityId) return;
 
         const dx = e.clientX - this.lastMouse.x;
@@ -575,6 +682,41 @@ export class CanvasEngine {
     };
 
     private onPointerUp = () => {
+        // --- EPHEMERAL DRAGGING PHASE 2 ---
+        // If we just finished a drag or resize, we must send ONE final permanent update to the database.
+        // During the drag, the 50ms network flush will have been sending 'ENTITY_DRAGGING' (which skips DB).
+        if (this.draggedEntityId || this.isResizing || this.isMultiDragging) {
+            const idsToSave = new Set<string>();
+            if (this.draggedEntityId) idsToSave.add(this.draggedEntityId);
+            this.draggedChildrenIds.forEach(id => idsToSave.add(id));
+            if (this.isMultiDragging) this.multiDragOffsets.forEach((_, id) => idsToSave.add(id));
+
+            idsToSave.forEach(id => {
+                const entity = this.scene.getObject(id);
+                if (entity) {
+                    const lightProps = { ...entity.props };
+                    delete lightProps.src;
+
+                    this.socket.emit('CANVAS_EVENT', {
+                        boardId: this.boardId,
+                        type: 'ENTITY_UPDATED',
+                        payload: {
+                            entityId: entity.id,
+                            updates: {
+                                transform: entity.transform,
+                                props: lightProps,
+                                metadata: entity.metadata,
+                                visible: entity.visible,
+                                parentId: entity.parentId
+                            }
+                        }
+                    });
+                    // Remove from pending so the interval flush doesn't send it again
+                    this.pendingNetworkUpdates.delete(id);
+                }
+            });
+        }
+
         if (this.creatingEntityId) {
             const entity = this.scene.getObject(this.creatingEntityId);
 
@@ -602,6 +744,43 @@ export class CanvasEngine {
             this.creatingEntityId = null; this.createStartPoint = null;
             this.switchTool('SELECT');
         }
+
+        // Finish marquee selection — select all entities within the marquee box
+        if (this.isMarqueeSelecting && this.marqueeStart && this.marqueeEnd) {
+            const minX = Math.min(this.marqueeStart.x, this.marqueeEnd.x);
+            const minY = Math.min(this.marqueeStart.y, this.marqueeEnd.y);
+            const maxX = Math.max(this.marqueeStart.x, this.marqueeEnd.x);
+            const maxY = Math.max(this.marqueeStart.y, this.marqueeEnd.y);
+
+            // Only select if the marquee was meaningful (not a simple click)
+            if (maxX - minX > 5 || maxY - minY > 5) {
+                const marqueeBBox: BBox = { minX, minY, maxX, maxY };
+                const entities = this.scene.getAllObjects();
+                const hitIds: string[] = [];
+
+                entities.forEach(entity => {
+                    if (!entity.visible) return;
+                    const typeDef = this.scene.getObjectType(entity.type);
+                    if (!typeDef) return;
+                    const bbox = typeDef.getBBox(entity);
+                    // Entity is selected if its bbox overlaps with the marquee box
+                    if (bbox.minX < marqueeBBox.maxX && bbox.maxX > marqueeBBox.minX &&
+                        bbox.minY < marqueeBBox.maxY && bbox.maxY > marqueeBBox.minY) {
+                        hitIds.push(entity.id);
+                    }
+                });
+
+                if (hitIds.length > 0) {
+                    this.selectionModule.selectMultiple(hitIds);
+                }
+            }
+        }
+
+        this.isMarqueeSelecting = false;
+        this.marqueeStart = null;
+        this.marqueeEnd = null;
+        this.isMultiDragging = false;
+        this.multiDragOffsets.clear();
 
         this.isPanning = false; this.isResizing = false;
         this.resizeHandle = null; this.resizeOriginal = null;
@@ -691,7 +870,8 @@ export class CanvasEngine {
                 }
             }
 
-            this.scene.createObject('IMAGE', { src, width: w, height: h }, { x: wx - w / 2, y: wy - h / 2 }, {}, parentId);
+            const id = this.scene.createObject('IMAGE', { src, width: w, height: h }, { x: wx - w / 2, y: wy - h / 2 }, {}, parentId);
+            this.selectionModule.select(id);
             this.isDirty = true;
             window.dispatchEvent(new Event('canvas-dirty'));
         };
@@ -734,7 +914,15 @@ export class CanvasEngine {
             this.ctx.scale(dpr, dpr);
             Renderer.render(this.ctx, this.width, this.height, this.camera, this.scene, {
                 hoveredId: this.hoveredEntityId,
-                hoveredAnchor: this.hoveredAnchor
+                hoveredAnchor: this.hoveredAnchor,
+                marqueeRect: this.isMarqueeSelecting && this.marqueeStart && this.marqueeEnd ? {
+                    minX: Math.min(this.marqueeStart.x, this.marqueeEnd.x),
+                    minY: Math.min(this.marqueeStart.y, this.marqueeEnd.y),
+                    maxX: Math.max(this.marqueeStart.x, this.marqueeEnd.x),
+                    maxY: Math.max(this.marqueeStart.y, this.marqueeEnd.y)
+                } : null,
+                remoteLocks: (() => { try { return this.lockModule.getRemoteLocks(); } catch (_) { return new Map(); } })(),
+                remoteMarquees: this.remoteMarquees
             });
             this.ctx.restore();
             this.isDirty = false;
@@ -754,9 +942,56 @@ export class CanvasEngine {
             this.networkFlushTimer = now;
             if (this.pendingNetworkUpdates.size > 0 && this.socket.connected) {
                 this.pendingNetworkUpdates.forEach(entity => {
-                    this.socket.emit('CANVAS_EVENT', { boardId: this.boardId, type: 'ENTITY_UPDATED', payload: { entity } });
+                    // Send lightweight updates: strip large immutable fields like image src
+                    const lightProps = { ...entity.props };
+                    delete lightProps.src; // src never changes during move/resize
+
+                    // --- EPHEMERAL DRAGGING PHASE 2 ---
+                    // Determine if this entity is actively being dragged/resized by the local user.
+                    // If so, emit as ENTITY_DRAGGING to skip DB saves.
+                    const isEphemeralDrag =
+                        this.draggedEntityId === entity.id ||
+                        this.draggedChildrenIds.includes(entity.id) ||
+                        (this.isMultiDragging && this.multiDragOffsets.has(entity.id)) ||
+                        (this.isResizing && this.draggedEntityId === entity.id);
+
+                    const broadcastType = isEphemeralDrag ? 'ENTITY_DRAGGING' : 'ENTITY_UPDATED';
+
+                    this.socket.emit('CANVAS_EVENT', {
+                        boardId: this.boardId,
+                        type: broadcastType,
+                        payload: {
+                            entityId: entity.id,
+                            updates: {
+                                transform: entity.transform,
+                                props: lightProps,
+                                metadata: entity.metadata,
+                                visible: entity.visible,
+                                parentId: entity.parentId
+                            }
+                        }
+                    });
                 });
                 this.pendingNetworkUpdates.clear();
+            }
+
+            const isMarqueeActive = this.isMarqueeSelecting && this.marqueeStart && this.marqueeEnd;
+            if (isMarqueeActive) {
+                this.socket.emit('CANVAS_EVENT', {
+                    boardId: this.boardId, type: 'MARQUEE_UPDATE', payload: {
+                        userName: this.lockUserName,
+                        rect: {
+                            minX: Math.min(this.marqueeStart!.x, this.marqueeEnd!.x),
+                            minY: Math.min(this.marqueeStart!.y, this.marqueeEnd!.y),
+                            maxX: Math.max(this.marqueeStart!.x, this.marqueeEnd!.x),
+                            maxY: Math.max(this.marqueeStart!.y, this.marqueeEnd!.y)
+                        }
+                    }
+                });
+                this.lastMarqueeBroadcast = true;
+            } else if (this.lastMarqueeBroadcast) {
+                this.socket.emit('CANVAS_EVENT', { boardId: this.boardId, type: 'MARQUEE_UPDATE', payload: { rect: null } });
+                this.lastMarqueeBroadcast = false;
             }
         }
 

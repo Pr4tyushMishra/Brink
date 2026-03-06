@@ -1,24 +1,60 @@
 import { useState, useEffect } from 'react';
 import { Shapes, Folder, Trash2, Plus, LayoutDashboard, Frame as FrameIcon, MoreVertical, Clock } from 'lucide-react';
+import { useAuth } from './contexts/AuthContext';
 import { BoardEditor } from './InfiniteCanvasApp';
-import type { Project, Board } from './types';
+import type { Project, Board } from './canvas/types';
 
 export default function BrinkDashboard() {
     const [currentView, setCurrentView] = useState<'landing' | 'board'>('landing');
     const [activeBoardId, setActiveBoardId] = useState<string | null>(null);
     const [activeBoardMenu, setActiveBoardMenu] = useState<string | null>(null);
 
-    // Mock State for Brink
-    const [projects, setProjects] = useState<Project[]>([
-        { id: 'p1', name: 'Personal Drafts' },
-        { id: 'p2', name: 'UI/UX Redesign' },
-    ]);
-    const [boards, setBoards] = useState<Board[]>([
-        { id: 'b1', projectId: 'p1', name: 'Brainstorming', lastEdited: '2 hrs ago' },
-        { id: 'b2', projectId: 'p2', name: 'Landing Page Flow', lastEdited: '1 day ago' },
-        { id: 'b3', projectId: 'p2', name: 'Design System', lastEdited: '3 days ago' },
-    ]);
-    const [activeProjectId, setActiveProjectId] = useState<string | null>('p2');
+    const { user, token, logout } = useAuth();
+
+    const [projects, setProjects] = useState<Project[]>([]);
+    const [boards, setBoards] = useState<Board[]>([]);
+    const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+
+    // Fetch boards from API
+    useEffect(() => {
+        const fetchBoards = async () => {
+            if (!token) return;
+            try {
+                const response = await fetch('http://localhost:3000/api/boards', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+
+                    // Defensive parsing as defined in the KI
+                    const boardList = Array.isArray(data) ? data : (data.boards || []);
+
+                    const formattedBoards = boardList.map((b: any) => ({
+                        id: b.id,
+                        projectId: b.projectId || 'default',
+                        name: b.name,
+                        lastEdited: new Date(b.updatedAt || b.createdAt).toLocaleDateString()
+                    }));
+
+                    setBoards(formattedBoards);
+
+                    // Setup a default project for the UI if none exist
+                    if (projects.length === 0 && formattedBoards.length > 0) {
+                        setProjects([{ id: 'default', name: 'My Boards' }]);
+                        setActiveProjectId('default');
+                    } else if (projects.length === 0) {
+                        setProjects([{ id: 'default', name: 'My Boards' }]);
+                        setActiveProjectId('default');
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to fetch boards", e);
+            }
+        };
+
+        fetchBoards();
+    }, [token]);
 
     useEffect(() => {
         // Set the initial state to landing so we have something to pop back to
@@ -58,18 +94,36 @@ export default function BrinkDashboard() {
         }
     };
 
-    const createBoard = () => {
-        if (!activeProjectId) return;
+    const createBoard = async () => {
+        if (!activeProjectId || !token) return;
 
-        // Instantly generate a blank board and open it
-        const newBoard = {
-            id: crypto.randomUUID(),
-            projectId: activeProjectId,
-            name: 'Untitled Board',
-            lastEdited: 'Just now'
-        };
-        setBoards([newBoard, ...boards]);
-        openBoard(newBoard.id);
+        try {
+            const response = await fetch('http://localhost:3000/api/boards', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify({ name: 'Untitled Board' })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                const newBoardObj = data.board || data;
+
+                const newBoard = {
+                    id: newBoardObj.id,
+                    projectId: activeProjectId,
+                    name: newBoardObj.name,
+                    lastEdited: 'Just now'
+                };
+
+                setBoards([newBoard, ...boards]);
+                openBoard(newBoard.id);
+            }
+        } catch (e) {
+            console.error("Failed to create board", e);
+        }
     };
 
     const openBoard = (id: string) => {
@@ -98,8 +152,25 @@ export default function BrinkDashboard() {
                         setActiveBoardId(null);
                     }
                 }}
-                onRename={(newName) => {
+                onRename={async (newName) => {
+                    // Optimistic update
                     setBoards(boards.map(b => b.id === activeBoard.id ? { ...b, name: newName } : b));
+
+                    // Persist to backend
+                    if (token) {
+                        try {
+                            await fetch(`http://localhost:3000/api/boards/${activeBoard.id}`, {
+                                method: 'PATCH',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${token}`
+                                },
+                                body: JSON.stringify({ name: newName })
+                            });
+                        } catch (e) {
+                            console.error("Failed to rename board", e);
+                        }
+                    }
                 }}
             />
         );
@@ -157,14 +228,20 @@ export default function BrinkDashboard() {
 
                 <div className="p-4 border-t border-slate-200">
                     <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-sm font-medium text-slate-600">
-                            U
+                        <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-sm font-medium text-slate-600 uppercase">
+                            {user?.name?.charAt(0) || 'U'}
                         </div>
-                        <div className="flex-1">
-                            <div className="text-sm font-medium">Test User</div>
-                            <div className="text-xs text-slate-500">Free Plan</div>
+                        <div className="flex-1 truncate">
+                            <div className="text-sm font-medium truncate">{user?.name || 'Loading User...'}</div>
+                            <div className="text-xs text-slate-500 truncate">{user?.email || ''}</div>
                         </div>
                     </div>
+                    <button
+                        onClick={logout}
+                        className="w-full mt-3 px-3 py-1.5 text-xs text-slate-500 hover:text-red-500 hover:bg-red-50 transition-colors rounded-md text-left"
+                    >
+                        Sign Out
+                    </button>
                 </div>
             </div>
 

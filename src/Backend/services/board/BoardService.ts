@@ -42,10 +42,16 @@ export class BoardService {
 
     async getSharesForBoard(boardId: string, userId: string) {
         const board = await boardRepository.getBoardById(boardId);
-        if (!board || board.ownerId !== userId) {
-            throw new Error("Unauthorized to view shares for this board");
+        if (!board) throw new Error("Board not found");
+
+        // Allow the owner OR any shared member to view the shares list
+        if (board.ownerId !== userId) {
+            const hasAccess = await boardRepository.checkUserAccess(boardId, userId);
+            if (!hasAccess) throw new Error("Unauthorized to view shares for this board");
         }
-        return await boardRepository.getSharesForBoard(boardId);
+
+        const shares = await boardRepository.getSharesForBoard(boardId);
+        return { shares, ownerId: board.ownerId };
     }
 
     async shareBoard(boardId: string, ownerId: string, targetEmail: string, role: 'VIEWER' | 'EDITOR') {

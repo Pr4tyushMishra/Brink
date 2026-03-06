@@ -15,6 +15,9 @@ import { moduleLoader } from '../../core/kernel/ModuleLoader';
 import { HistoryModule } from '../../modules/history/HistoryModule';
 
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
+import staticPlugin from '@fastify/static';
+import path from 'path';
 
 const server = Fastify({
     logger: false
@@ -27,17 +30,32 @@ server.register(cors, {
     credentials: true,
 });
 
+// Setup File Uploads
+server.register(multipart, {
+    limits: {
+        fileSize: 50 * 1024 * 1024, // 50MB limit
+    }
+});
+
+// Setup Static File Serving for Uploads
+server.register(staticPlugin, {
+    root: path.join(process.cwd(), 'uploads'),
+    prefix: '/uploads/',
+});
+
 // Let's listen to an event to prove the EventBus works
 eventBus.onEvent('API_HEALTH_CHECK', (payload) => {
     logger.info('Event received from EventBus:', payload);
 });
 
 import { AuthRouter } from '../../services/auth/AuthRouter';
+import { assetController } from '../../services/assets/AssetController';
 
 // Register Controllers (Routes)
 server.register(AuthRouter, { prefix: '/api/auth' });
 server.register(boardController, { prefix: '/api' });
 server.register(eventController, { prefix: '/api' });
+server.register(assetController, { prefix: '/api/assets' });
 
 // Setup WebSockets (Realtime)
 setupRealtimeServer(server);

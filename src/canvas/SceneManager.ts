@@ -61,7 +61,7 @@ export class SceneManager {
         return id;
     }
 
-    updateObject(id: string, updates: Partial<Pick<CanvasEntity, 'props' | 'metadata' | 'visible' | 'parentId'>> & { transform?: Partial<Transform> }) {
+    updateObject(id: string, updates: Partial<Pick<CanvasEntity, 'props' | 'metadata' | 'visible' | 'parentId'>> & { transform?: Partial<Transform> }, silent = false) {
         const entity = this.entities.get(id);
         if (!entity) return;
 
@@ -73,14 +73,18 @@ export class SceneManager {
         };
 
         this.entities.set(id, updatedEntity);
-        this.events.emit(EVENTS.ENTITY_UPDATED, { old: entity, new: updatedEntity });
+        if (!silent) {
+            this.events.emit(EVENTS.ENTITY_UPDATED, { old: entity, new: updatedEntity });
+        }
     }
 
-    deleteObject(id: string) {
+    deleteObject(id: string, silent = false) {
         const entity = this.entities.get(id);
         if (entity) {
             this.entities.delete(id);
-            this.events.emit(EVENTS.ENTITY_DELETED, entity);
+            if (!silent) {
+                this.events.emit(EVENTS.ENTITY_DELETED, entity);
+            }
         }
     }
 

@@ -68,15 +68,32 @@ export async function boardController(server: FastifyInstance) {
     server.get<{ Params: { id: string } }>('/boards/:id/shares', { preValidation: [authGuard] }, async (request, reply) => {
         try {
             const userId = (request as any).userId;
-            const shares = await boardService.getSharesForBoard(request.params.id, userId);
+            const { shares, ownerId } = await boardService.getSharesForBoard(request.params.id, userId);
 
-            // Map to a clean frontend model
+            // Map shared collaborators
             const formatted = shares.map(s => ({
                 id: s.userId,
-                name: (s as any).user.name || 'User', // Requires name in Prisma User model, relying on email for now
+                name: (s as any).user.name || 'User',
                 email: (s as any).user.email,
                 role: s.role
             }));
+
+            // Prepend the board owner so the frontend always has the host
+            if (ownerId) {
+                const { prisma } = await import('../../core/database/prisma');
+                const owner = await prisma.user.findUnique({
+                    where: { id: ownerId },
+                    select: { id: true, email: true, name: true }
+                });
+                if (owner && !formatted.some(f => f.id === owner.id)) {
+                    formatted.unshift({
+                        id: owner.id,
+                        name: owner.name || 'Board Owner',
+                        email: owner.email,
+                        role: 'OWNER' as any
+                    });
+                }
+            }
 
             return reply.status(200).send(formatted);
         } catch (error: any) {

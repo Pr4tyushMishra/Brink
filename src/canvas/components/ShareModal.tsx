@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Users, Mail, Copy, Check, Globe } from 'lucide-react';
-import type { Board } from '../../types';
+import type { Board } from '../types';
 
 interface ShareModalProps {
     board: Board;
@@ -25,19 +25,7 @@ export function ShareModal({ board, onClose }: ShareModalProps) {
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
-                    let updatedCollaborators = data;
-                    // If the current user is the board owner and not already in the shares list, add them
-                    // Since the Frontend 'Board' type doesn't expose ownerId yet from the API by default unless we updated BrinkDashboard,
-                    // we'll just check if the array is empty and add the user optimistically as OWNER if so for Phase 9 prototype.
-                    if (user && !data.some((col: any) => col.id === user.id)) {
-                        updatedCollaborators = [{
-                            id: user.id,
-                            email: user.email,
-                            name: user.name,
-                            role: 'OWNER'
-                        }, ...data];
-                    }
-                    setCollaborators(updatedCollaborators);
+                    setCollaborators(data);
                 }
             })
             .catch(err => console.error("Failed to load shares", err));

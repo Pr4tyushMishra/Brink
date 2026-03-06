@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../../core/database/prisma';
+import { logger } from '../../core/logger/logger';
 
 const JWT_SECRET = process.env.JWT_SECRET as string;
 
@@ -41,7 +42,7 @@ export async function AuthRouter(server: FastifyInstance) {
             });
 
         } catch (error) {
-            server.log.error(error);
+            logger.error('Registration error:', error);
             return reply.status(500).send({ error: 'Failed to register user' });
         }
     });
@@ -74,7 +75,7 @@ export async function AuthRouter(server: FastifyInstance) {
             });
 
         } catch (error) {
-            server.log.error(error);
+            logger.error('Login error:', error);
             return reply.status(500).send({ error: 'Failed to login' });
         }
     });

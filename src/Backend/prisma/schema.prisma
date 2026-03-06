@@ -15,8 +15,9 @@ model User {
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
-  boards       Board[]      @relation("BoardOwner")
-  sharedBoards BoardShare[]
+  boards         Board[]      @relation("BoardOwner")
+  sharedBoards   BoardShare[]
+  uploadedAssets Asset[]
 }
 
 model Board {
@@ -76,4 +77,16 @@ model Entity {
   parentId  String?
 
   board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+}
+
+model Asset {
+  id        String   @id @map("_id") // Using UUID from backend
+  filename  String
+  path      String   // URL accessible path
+  mimeType  String
+  size      Int
+  uploadedBy String  @db.ObjectId
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [uploadedBy], references: [id])
 }

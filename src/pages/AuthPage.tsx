@@ -39,7 +39,8 @@ export const AuthPage: React.FC = () => {
 
             // Success! Save to AuthContext
             login(data.token, data.user);
-            navigate('/app', { replace: true });
+            console.log("Navigation to dashboard triggered");
+            navigate('/dashboard', { replace: true });
         } catch (e) {
             setErrorMsg('Network error connecting to server');
             setIsLoading(false);

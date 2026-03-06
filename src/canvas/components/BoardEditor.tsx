@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { MousePointer2, Square, StickyNote, ZoomIn, ZoomOut, Maximize, Trash2, Type, Circle, Minus, Frame as FrameIcon, Triangle, Diamond, ArrowRight, Shapes, ArrowLeft, Download, Upload } from 'lucide-react';
-import type { Board } from '../../types';
+import { MousePointer2, Square, StickyNote, ZoomIn, ZoomOut, Maximize, Trash2, Type, Circle, Minus, Frame as FrameIcon, Triangle, Diamond, ArrowRight, Shapes, ArrowLeft, Download, Upload, ImagePlus } from 'lucide-react';
+import type { Board } from '../types';
 import type { ToolType } from '../CanvasEngine';
 import { CanvasEngine } from '../CanvasEngine';
 import { EVENTS } from '../EventBus';
@@ -93,6 +93,7 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
         engine.onToolChange = (tool) => setActiveTool(tool as any);
         engine.onZoomChange = (z) => setZoomLevel(z);
         engine.onRoleAssigned = (role) => setUserRole(role as any);
+        engine.lockUserName = user?.name || user?.email || 'User';
 
         const handleImageRequest = (frameId: string) => {
             targetFrameRef.current = frameId;
@@ -188,14 +189,15 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
             })
             .catch(err => console.error("Failed to load generic board data for " + board.id, err));
 
-        // Fetch shared collaborators (this endpoint returns viewers and editors)
+        // Fetch shared collaborators (this endpoint now returns the owner + all shared members)
         fetch(`http://localhost:3000/api/boards/${board.id}/shares`, {
             headers: { 'Authorization': `Bearer ${token}` }
         })
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
-                    setCollaborators(data);
+                    // Filter out the current user — they're already shown as "(You)" at the top
+                    setCollaborators(data.filter((c: any) => c.id !== user?.id));
                 }
             })
             .catch(err => console.error("Failed to load collaborators", err));
@@ -232,17 +234,41 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
         setShowCollaboratorsMenu(false);
     };
 
-    const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            const src = event.target?.result as string;
-            engineRef.current?.addImage(src, targetFrameRef.current || undefined);
+
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            // Need to pass the JWT token for backend authentication
+            const response = await fetch('http://localhost:3000/api/assets/upload', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                },
+                body: formData
+            });
+
+            if (!response.ok) {
+                console.error('Failed to upload image', await response.text());
+                return;
+            }
+
+            const data = await response.json();
+
+            // The backend gives us a clean, static URL like /uploads/images/xxx.png
+            // We create the image entity using this URL instead of a massive base64 string
+            const assetUrl = `http://localhost:3000${data.url}`;
+            engineRef.current?.addImage(assetUrl, targetFrameRef.current || undefined);
+
+        } catch (error) {
+            console.error('Error uploading image:', error);
+        } finally {
             targetFrameRef.current = null;
-        };
-        reader.readAsDataURL(file);
-        e.target.value = '';
+            if (fileInputRef.current) fileInputRef.current.value = '';
+        }
     };
 
     const handleExportBoard = () => {
@@ -343,17 +369,22 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
                             onClick={() => setShowCollaboratorsMenu(!showCollaboratorsMenu)}
                         >
                             <div className="flex -space-x-2">
-                                {/* Owner (Implicitly derived or injected) */}
-                                <div className="w-8 h-8 rounded-full border-2 border-white bg-blue-600 text-white flex items-center justify-center font-bold text-sm z-30 shadow-sm" title={user?.name || "Board Owner"}>
-                                    {user?.name?.[0]?.toUpperCase() || 'O'}
+                                {/* Current User Avatar — color reflects actual role */}
+                                <div
+                                    className={`w-8 h-8 rounded-full border-2 border-white text-white flex items-center justify-center font-bold text-sm z-30 shadow-sm ${userRole === 'OWNER' ? 'bg-blue-600' : userRole === 'EDITOR' ? 'bg-emerald-500' : 'bg-slate-400'
+                                        }`}
+                                    title={`${user?.name || 'You'} (${userRole === 'OWNER' ? 'Host' : userRole})`}
+                                >
+                                    {user?.name?.[0]?.toUpperCase() || 'U'}
                                 </div>
-                                {/* Map actual collaborators from the database */}
+                                {/* Other collaborators — colored by their role */}
                                 {collaborators.map((collab, index) => (
                                     <div
                                         key={collab.id}
-                                        className={`w-8 h-8 rounded-full border-2 border-white text-white flex items-center justify-center font-bold text-sm shadow-sm ${index % 2 === 0 ? 'bg-green-500' : 'bg-purple-500'}`}
+                                        className={`w-8 h-8 rounded-full border-2 border-white text-white flex items-center justify-center font-bold text-sm shadow-sm ${collab.role === 'OWNER' ? 'bg-blue-600' : collab.role === 'EDITOR' ? 'bg-emerald-500' : 'bg-slate-400'
+                                            }`}
                                         style={{ zIndex: 20 - index }}
-                                        title={`${collab.name || collab.email} (${collab.role})`}
+                                        title={`${collab.name || collab.email} (${collab.role === 'OWNER' ? 'Host' : collab.role})`}
                                     >
                                         {(collab.name || collab.email || '?')[0].toUpperCase()}
                                     </div>
@@ -366,39 +397,53 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
 
                         {/* Collaborators Dropdown Menu */}
                         {showCollaboratorsMenu && (
-                            <div className="absolute top-full right-0 mt-2 w-64 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-50 animate-in fade-in zoom-in-95 duration-100">
+                            <div className="absolute top-full right-0 mt-2 w-72 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-50 animate-in fade-in zoom-in-95 duration-100">
                                 <div className="px-4 py-2 border-b border-slate-100 flex justify-between items-center">
                                     <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">Active Members</span>
                                     <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-medium">{collaborators.length + 1}</span>
                                 </div>
 
                                 <div className="max-h-[300px] overflow-y-auto">
-                                    {/* Host */}
+                                    {/* Current User — shows their actual role */}
                                     <div className="px-4 py-2.5 hover:bg-slate-50 flex items-center gap-3">
-                                        <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
-                                            {user?.name?.[0]?.toUpperCase() || 'O'}
+                                        <div className={`w-8 h-8 rounded-full text-white flex items-center justify-center font-bold text-sm shrink-0 ${userRole === 'OWNER' ? 'bg-blue-600' : userRole === 'EDITOR' ? 'bg-emerald-500' : 'bg-slate-400'
+                                            }`}>
+                                            {user?.name?.[0]?.toUpperCase() || 'U'}
                                         </div>
                                         <div className="flex-1 min-w-0">
-                                            <div className="text-sm font-semibold text-slate-800 truncate">{user?.name || 'Board Owner'} <span className="text-xs font-normal text-slate-500 ml-1">(You)</span></div>
+                                            <div className="text-sm font-semibold text-slate-800 truncate">
+                                                {user?.name || 'You'} <span className="text-xs font-normal text-slate-500 ml-1">(You)</span>
+                                            </div>
                                             <div className="text-xs text-slate-500 truncate">{user?.email || ''}</div>
                                         </div>
-                                        <span className="text-[10px] font-bold px-2 py-0.5 bg-blue-100 text-blue-700 rounded-md uppercase tracking-wide">
-                                            Host
+                                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wide ${userRole === 'OWNER'
+                                            ? 'bg-blue-100 text-blue-700'
+                                            : userRole === 'EDITOR'
+                                                ? 'bg-emerald-100 text-emerald-700'
+                                                : 'bg-slate-100 text-slate-500'
+                                            }`}>
+                                            {userRole === 'OWNER' ? 'Host' : userRole}
                                         </span>
                                     </div>
 
-                                    {/* Team Members */}
-                                    {collaborators.map((collab, index) => (
+                                    {/* Other Members — each with their actual role */}
+                                    {collaborators.map((collab) => (
                                         <div key={collab.id} className="px-4 py-2.5 hover:bg-slate-50 flex items-center gap-3 border-t border-slate-50">
-                                            <div className={`w-8 h-8 rounded-full text-white flex items-center justify-center font-bold text-sm shrink-0 ${index % 2 === 0 ? 'bg-green-500' : 'bg-purple-500'}`}>
+                                            <div className={`w-8 h-8 rounded-full text-white flex items-center justify-center font-bold text-sm shrink-0 ${collab.role === 'OWNER' ? 'bg-blue-600' : collab.role === 'EDITOR' ? 'bg-emerald-500' : 'bg-slate-400'
+                                                }`}>
                                                 {(collab.name || collab.email || '?')[0].toUpperCase()}
                                             </div>
                                             <div className="flex-1 min-w-0">
                                                 <div className="text-sm font-semibold text-slate-800 truncate">{collab.name || collab.email.split('@')[0]}</div>
                                                 <div className="text-xs text-slate-500 truncate">{collab.email}</div>
                                             </div>
-                                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wide ${collab.role === 'EDITOR' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
-                                                {collab.role}
+                                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wide ${collab.role === 'OWNER'
+                                                ? 'bg-blue-100 text-blue-700'
+                                                : collab.role === 'EDITOR'
+                                                    ? 'bg-emerald-100 text-emerald-700'
+                                                    : 'bg-slate-100 text-slate-500'
+                                                }`}>
+                                                {collab.role === 'OWNER' ? 'Host' : collab.role}
                                             </span>
                                         </div>
                                     ))}
@@ -410,18 +455,21 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
                                     )}
                                 </div>
 
-                                <div className="px-4 pt-2 mt-2 border-t border-slate-100">
-                                    <button
-                                        onClick={() => {
-                                            setShowCollaboratorsMenu(false);
-                                            setShowShareModal(true);
-                                        }}
-                                        className="w-full py-1.5 text-sm font-medium text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors flex items-center justify-center gap-2"
-                                    >
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="19" y1="8" x2="19" y2="14" /><line x1="22" y1="11" x2="16" y2="11" /></svg>
-                                        Invite People
-                                    </button>
-                                </div>
+                                {/* Only show Invite button for Host or Editor */}
+                                {(userRole === 'OWNER' || userRole === 'EDITOR') && (
+                                    <div className="px-4 pt-2 mt-2 border-t border-slate-100">
+                                        <button
+                                            onClick={() => {
+                                                setShowCollaboratorsMenu(false);
+                                                setShowShareModal(true);
+                                            }}
+                                            className="w-full py-1.5 text-sm font-medium text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors flex items-center justify-center gap-2"
+                                        >
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="19" y1="8" x2="19" y2="14" /><line x1="22" y1="11" x2="16" y2="11" /></svg>
+                                            Invite People
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -520,8 +568,17 @@ export function BoardEditor({ board, onBack, onRename }: { board: Board, onBack:
                         )}
                     </div>
 
+                    <ToolButton
+                        icon={<ImagePlus size={20} />}
+                        label="Add Image"
+                        active={false}
+                        onClick={() => {
+                            targetFrameRef.current = null;
+                            fileInputRef.current?.click();
+                        }}
+                    />
+
                     <div className="w-px h-auto md:w-full md:h-px bg-slate-100 mx-1 md:my-1 md:mx-0 shrink-0"></div>
-                    {/* Fixed the inline engineRef usage to call a wrapper function if we want, or leave inline with optional chaining */}
                     <ToolButton icon={<Trash2 size={20} className="text-red-500" />} label="Delete Selected" active={false} onClick={() => engineRef.current?.selectionModule.deleteSelected()} />
                 </div>
             )}

@@ -37,6 +37,16 @@ export class SelectionModule implements FeatureModule {
         this.broadcastSelection();
     }
 
+    selectMultiple(ids: string[]) {
+        this.selectedIds.forEach(sid => this.sceneManager.updateObject(sid, { metadata: { selected: false } }));
+        this.selectedIds.clear();
+        ids.forEach(id => {
+            this.selectedIds.add(id);
+            this.sceneManager.updateObject(id, { metadata: { selected: true } });
+        });
+        this.broadcastSelection();
+    }
+
     clearSelection() {
         this.selectedIds.forEach(sid => this.sceneManager.updateObject(sid, { metadata: { selected: false } }));
         this.selectedIds.clear();
