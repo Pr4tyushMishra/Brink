@@ -42,4 +42,3 @@ src/Backend/*.json
 test-*.js
 test-*.ts
 inspect-*.js
-/Users/pratyushmishra/Desktop/Brink/src/Backend/test-ws.js
